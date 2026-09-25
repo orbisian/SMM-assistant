@@ -132,7 +132,7 @@ FIELD_ALIASES = {
     "musiqa": ["musiqa", "music", "musiqa referens", "muzika"],
     "montajor_deadline": ["montajor deadline", "montaj deadline", "montajor muddati"],
     "otish_3s": ["3s o'tish", "3s o‘tish", "3s otish", "3 soniya o'tish", "o'tish"],
-    "cta": ["cta", "cta knopka", "obuna knopka"],
+    "cta": ["cta", "cta follow", "cta knopka", "obuna knopka", "follow"],
 }
 
 
