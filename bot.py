@@ -699,19 +699,38 @@ async def cmd_yubor(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "\n\nHar mavzu ichida /mavzu buyrug'ini yozing.")
         return
 
-    # Nechta / qaysilar
-    arg = context.args[1] if len(context.args) > 1 else "1"
-    explicit_nos = None
-    if "," in arg:
-        explicit_nos = [int(x) for x in arg.split(",") if x.strip().isdigit()]
-        count = len(explicit_nos)
-    else:
-        try:
-            count = int(arg)
-        except ValueError:
-            await msg.reply_text("Son noto'g'ri. Masalan: `/yubor megago 3`",
-                                 parse_mode=ParseMode.MARKDOWN)
-            return
+    # Qaysi kontentlar: 5  |  3-7  |  2,5,7  |  2,4-6
+    arg = "".join(context.args[1:]) if len(context.args) > 1 else ""
+    if not arg:
+        await msg.reply_text(
+            "Kontent raqamini yozing:\n"
+            "`/yubor megago 5` — faqat №5\n"
+            "`/yubor megago 3-7` — №3 dan №7 gacha\n"
+            "`/yubor megago 2,5,7` — aniq raqamlar",
+            parse_mode=ParseMode.MARKDOWN)
+        return
+
+    wanted = set()
+    try:
+        for part in arg.split(","):
+            part = part.strip()
+            if not part:
+                continue
+            if "-" in part:
+                a, b = part.split("-", 1)
+                a, b = int(a), int(b)
+                if a > b:
+                    a, b = b, a
+                if b - a > 50:
+                    raise ValueError("oraliq juda katta")
+                wanted.update(range(a, b + 1))
+            else:
+                wanted.add(int(part))
+    except ValueError:
+        await msg.reply_text(
+            "Raqam noto'g'ri. Masalan: `/yubor megago 5` yoki `/yubor megago 3-7`",
+            parse_mode=ParseMode.MARKDOWN)
+        return
 
     wait = await msg.reply_text(f"Notion'dan {p[1]} o'qilyapti...")
 
@@ -734,14 +753,16 @@ async def cmd_yubor(update: Update, context: ContextTypes.DEFAULT_TYPE):
     rows.sort(key=lambda r: (as_int(r.get("no")) is None,
                              as_int(r.get("no")) or 0))
 
-    # Tanlash
-    if explicit_nos:
-        selected = [r for r in rows if as_int(r.get("no")) in explicit_nos]
-    else:
-        selected = [r for r in rows if as_int(r.get("no")) is not None][:count]
+    # Tanlash — faqat so'ralgan raqamlar
+    selected = [r for r in rows if as_int(r.get("no")) in wanted]
+    found = {as_int(r.get("no")) for r in selected}
+    missing_nos = sorted(wanted - found)
 
     if not selected:
-        await wait.edit_text("Mos kontent topilmadi.")
+        await wait.edit_text(
+            f"№{', '.join(map(str, sorted(wanted)))} Notion'da topilmadi.\n"
+            f"Ro'yxatni ko'rish: `/royxat {key}`",
+            parse_mode=ParseMode.MARKDOWN)
         return
 
     # Holat ustunini aniqlash
@@ -779,6 +800,7 @@ async def cmd_yubor(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "musiqa": row.get("musiqa"),
             "otish_3s": row.get("otish_3s"),
             "cta": row.get("cta"),
+            "cover": row.get("cover"),
             "ssenariy": ssenariy,
         }
 
@@ -796,6 +818,10 @@ async def cmd_yubor(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"[{idx}/{len(selected)}] #{no} — {nomi[:30]}\nTZ tayyorlanyapti...")
         creative_raw = ask_llm(P.CREATIVE_SYSTEM, P.build_creative_prompt(base), 1500)
         creative = P.parse_creative(creative_raw)
+
+        # Notion'da cover matni yozilgan bo'lsa — o'shani ishlatamiz
+        if base.get("cover") and str(base["cover"]).strip():
+            creative["cover_text"] = str(base["cover"]).strip()
 
         style = get_style(key)
         dl_montajor, dl_dizayner = calc_deadlines(
@@ -823,11 +849,12 @@ async def cmd_yubor(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         done.append(f"#{no} {nomi[:35]}")
 
-    await wait.edit_text(
-        f"✅ *{p[1]}* — {len(done)} ta kontent yuborildi\n\n" +
-        "\n".join(done) +
-        f"\n\nHolat «{STATUS_JARAYONDA}» ga o'tkazildi.",
-        parse_mode=ParseMode.MARKDOWN)
+    final = (f"✅ *{p[1]}* — {len(done)} ta kontent yuborildi\n\n" +
+             "\n".join(done) +
+             f"\n\nHolat «{STATUS_JARAYONDA}» ga o'tkazildi.")
+    if missing_nos:
+        final += f"\n\n⚠️ Topilmadi: №{', '.join(map(str, missing_nos))}"
+    await wait.edit_text(final, parse_mode=ParseMode.MARKDOWN)
 
 
 # ==================== Referens rasmlari ====================
