@@ -27,7 +27,7 @@ from telegram.ext import (
 )
 
 import notion_api
-from prompts import build_prompt, STYLE_GUIDES, TYPES
+import prompts as P
 
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("tz-bot")
@@ -42,11 +42,13 @@ MODEL = "claude-sonnet-4-6"
 TG_LIMIT = 3900
 
 # Deadline: Sana'dan necha kun oldin (o'zgartirish mumkin)
-DEADLINE_OFFSETS = {
-    "operator": 3,
-    "montajor": 1,
-    "dizayner": 1,
-}
+# Deadline sozlamalari
+# Montajor deadline: chiqish sanasidan necha kun oldin (vaqt Notion'dan olinadi)
+MONTAJOR_DAYS_BEFORE = 1
+# Dizayner montajordan necha soat oldin tugatadi
+DIZAYNER_HOURS_BEFORE = 3
+# Notion'da vaqt yozilmagan bo'lsa ishlatiladigan standart vaqt
+DEFAULT_MONTAJOR_TIME = "18:00"
 
 # Mavzu turlari
 TOPICS = {
@@ -91,6 +93,12 @@ def init_db():
         file_id TEXT NOT NULL,
         added_at TEXT NOT NULL,
         PRIMARY KEY (project, no, file_id)
+    )""")
+    c.execute("""CREATE TABLE IF NOT EXISTS styles (
+        project TEXT PRIMARY KEY,
+        shrift TEXT,
+        ranglar TEXT,
+        raw TEXT
     )""")
     c.execute("""CREATE TABLE IF NOT EXISTS sent_log (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -181,6 +189,27 @@ def get_refs(project, no):
     return [r[0] for r in rows]
 
 
+def set_style(project, shrift, ranglar, raw):
+    conn = db()
+    conn.execute(
+        "INSERT INTO styles (project, shrift, ranglar, raw) VALUES (?,?,?,?) "
+        "ON CONFLICT(project) DO UPDATE SET shrift=excluded.shrift, "
+        "ranglar=excluded.ranglar, raw=excluded.raw",
+        (project, shrift, ranglar, raw))
+    conn.commit()
+    conn.close()
+
+
+def get_style(project):
+    conn = db()
+    row = conn.execute(
+        "SELECT shrift, ranglar, raw FROM styles WHERE project=?", (project,)).fetchone()
+    conn.close()
+    if not row:
+        return {}
+    return {"shrift": row[0], "ranglar": row[1], "raw": row[2]}
+
+
 def log_sent(project, no, tz_type, page_id):
     conn = db()
     conn.execute("INSERT INTO sent_log (project,no,tz_type,page_id,sent_at) VALUES (?,?,?,?,?)",
@@ -237,17 +266,48 @@ def owner_only(func):
     return wrapper
 
 
-def calc_deadline(sana_str, tz_type):
-    """Sana'dan orqaga hisoblab deadline chiqaradi."""
+def _parse_time(text):
+    """'15:00', '15.00', '15' -> (15, 0). Topilmasa None."""
+    if not text:
+        return None
+    m = re.search(r"(\d{1,2})\s*[:.]\s*(\d{2})", str(text))
+    if m:
+        h, mi = int(m.group(1)), int(m.group(2))
+    else:
+        m = re.search(r"\b(\d{1,2})\b", str(text))
+        if not m:
+            return None
+        h, mi = int(m.group(1)), 0
+    if 0 <= h <= 23 and 0 <= mi <= 59:
+        return h, mi
+    return None
+
+
+def calc_deadlines(sana_str, montajor_time_text):
+    """
+    Montajor va dizayner deadline'larini hisoblaydi.
+
+    Montajor: chiqish sanasidan MONTAJOR_DAYS_BEFORE kun oldin,
+              vaqt Notion'dagi «Montajor deadline» dan
+    Dizayner: montajordan DIZAYNER_HOURS_BEFORE soat oldin
+
+    Qaytaradi: (montajor_matn, dizayner_matn)
+    """
     if not sana_str:
-        return "sana belgilanmagan — aniqlashtirish kerak"
+        msg = "chiqish sanasi belgilanmagan"
+        return msg, msg
+
     try:
-        d = datetime.fromisoformat(sana_str[:10])
+        d = datetime.fromisoformat(str(sana_str)[:10])
     except ValueError:
-        return sana_str
-    offset = DEADLINE_OFFSETS.get(tz_type, 1)
-    dl = d - timedelta(days=offset)
-    return dl.strftime("%d.%m.%Y")
+        return str(sana_str), str(sana_str)
+
+    t = _parse_time(montajor_time_text) or _parse_time(DEFAULT_MONTAJOR_TIME)
+    montajor = (d - timedelta(days=MONTAJOR_DAYS_BEFORE)).replace(hour=t[0], minute=t[1])
+    dizayner = montajor - timedelta(hours=DIZAYNER_HOURS_BEFORE)
+
+    fmt = "%d.%m.%Y, %H:%M"
+    return montajor.strftime(fmt), dizayner.strftime(fmt)
 
 
 def norm_key(text):
@@ -283,19 +343,21 @@ async def send_to_topic(context, thread_id, text, photos=None):
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = (
         "*TotMega TZ Bot*\n\n"
-        "*Sozlash (bir marta):*\n"
-        "/id — mavzu ichida yozing, ID chiqadi\n"
-        "/mavzu <turi> — mavzuni biriktirish\n"
-        "   turlari: ssenariy, tz\\_video, tz\\_dizayn\n"
-        "/loyiha <kalit> <nom> <notion\\_db\\_id> — loyiha qo'shish\n"
-        "/video <kalit> — tayyor videolar mavzusini biriktirish\n"
-        "/holat — sozlamalarni ko'rish\n"
-        "/tekshir — Notion ulanishini tekshirish\n\n"
         "*Ishlatish:*\n"
         "/yubor <loyiha> <son> — TZ yuborish\n"
-        "   masalan: `/yubor megago 3`\n"
+        "   masalan: `/yubor megago 3` yoki `/yubor amuzar 2,5`\n"
         "/royxat <loyiha> — kontent ro'yxati\n\n"
-        "*Referens:* rasmni botga yuboring, izohiga `megago 3` deb yozing"
+        "*Stilistika:*\n"
+        "/stil <loyiha> — ko'rish yoki saqlash\n"
+        "   `/stil amuzar`\n"
+        "   `Shrift: Montserrat Bold`\n"
+        "   `Ranglar: #0A6EBD, oq`\n\n"
+        "*Referens:* rasmni yuboring, izohiga `megago 3`\n\n"
+        "*Sozlash:*\n"
+        "/loyiha <kalit> <nom> <notion\\_id> — loyiha qo'shish/almashtirish\n"
+        "/mavzu <turi> — mavzu ichida (ssenariy, tz\\_video, tz\\_dizayn)\n"
+        "/video <kalit> — tayyor videolar mavzusi ichida\n"
+        "/holat · /tekshir · /id"
     )
     await update.message.reply_text(text, parse_mode=ParseMode.MARKDOWN)
 
@@ -380,6 +442,85 @@ async def cmd_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     set_project(key, p[1], video_thread=tid)
     await msg.reply_text(f"✅ '{p[1]}' tayyor videolar mavzusi biriktirildi (ID: {tid})")
+
+
+@owner_only
+async def cmd_stil(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    Loyiha stilistikasini saqlaydi.
+
+    /stil amuzar
+    Shrift: Montserrat Bold
+    Ranglar: #0A6EBD, oq
+    """
+    text = update.message.text or ""
+    lines = text.split("\n")
+    first = lines[0].split(maxsplit=2)
+
+    if len(first) < 2:
+        keys = ", ".join(p[0] for p in all_projects()) or "yo'q"
+        await update.message.reply_text(
+            "Foydalanish:\n\n"
+            "`/stil amuzar`\n"
+            "`Shrift: Montserrat Bold`\n"
+            "`Ranglar: #0A6EBD, oq`\n\n"
+            f"Ko'rish uchun: `/stil amuzar`\nLoyihalar: {keys}",
+            parse_mode=ParseMode.MARKDOWN)
+        return
+
+    key = norm_key(first[1])
+    p = get_project(key)
+    if not p:
+        await update.message.reply_text(f"'{key}' loyihasi topilmadi.")
+        return
+
+    # Birinchi qatordan keyingi matn (yoki shu qatorning davomi)
+    body_parts = []
+    if len(first) > 2:
+        body_parts.append(first[2])
+    body_parts.extend(lines[1:])
+    body = "\n".join(body_parts).strip()
+
+    # Faqat ko'rish
+    if not body:
+        s = get_style(key)
+        if not s:
+            await update.message.reply_text(f"{p[1]} uchun stilistika hali yo'q.")
+            return
+        await update.message.reply_text(
+            f"*{p[1]}* stilistikasi:\n\n"
+            f"Shrift: {s.get('shrift') or '—'}\n"
+            f"Ranglar: {s.get('ranglar') or '—'}",
+            parse_mode=ParseMode.MARKDOWN)
+        return
+
+    shrift, ranglar = None, None
+    for ln in body.split("\n"):
+        low = ln.lower()
+        if ":" not in ln:
+            continue
+        val = ln.split(":", 1)[1].strip()
+        if low.startswith(("shrift", "font", "шрифт")):
+            shrift = val
+        elif low.startswith(("rang", "color", "цвет")):
+            ranglar = val
+
+    if not shrift and not ranglar:
+        await update.message.reply_text(
+            "«Shrift:» yoki «Ranglar:» qatorlari topilmadi.\n"
+            "Har birini alohida qatorga yozing.")
+        return
+
+    # Eskisini saqlab qolish — faqat berilganini yangilash
+    old = get_style(key)
+    shrift = shrift or old.get("shrift")
+    ranglar = ranglar or old.get("ranglar")
+    set_style(key, shrift, ranglar, body)
+
+    await update.message.reply_text(
+        f"✅ {p[1]} stilistikasi saqlandi\n\n"
+        f"Shrift: {shrift or '—'}\n"
+        f"Ranglar: {ranglar or '—'}")
 
 
 @owner_only
@@ -626,13 +767,6 @@ async def cmd_yubor(update: Update, context: ContextTypes.DEFAULT_TYPE):
             ssenariy = ""
             log.warning("Ssenariy o'qilmadi: %s", e)
 
-        # Qo'shimcha ustunlar (ba'zi jadvallarda bor)
-        extra = []
-        for label, field in (("Hook", "hook"), ("Montaj", "montaj"), ("Maqsad", "maqsad")):
-            val = row.get(field)
-            if val:
-                extra.append(f"{label}: {val}")
-
         base = {
             "no": no,
             "nomi": nomi,
@@ -640,7 +774,11 @@ async def cmd_yubor(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "format": row.get("format"),
             "sana": row.get("sana"),
             "reference": row.get("reference"),
-            "eslatma": "; ".join([x for x in [row.get("eslatma")] + extra if x]),
+            "hook": row.get("hook"),
+            "hook_video": row.get("hook_video"),
+            "musiqa": row.get("musiqa"),
+            "otish_3s": row.get("otish_3s"),
+            "cta": row.get("cta"),
             "ssenariy": ssenariy,
         }
 
@@ -653,25 +791,28 @@ async def cmd_yubor(update: Update, context: ContextTypes.DEFAULT_TYPE):
             ss_text += f"\n\nNotion: {row['_url']}"
         await send_to_topic(context, th_ssenariy, ss_text)
 
+        # 2) Ijodiy qismlar — bitta LLM so'rovi (highlight, b-roll, cover matni)
+        await wait.edit_text(
+            f"[{idx}/{len(selected)}] #{no} — {nomi[:30]}\nTZ tayyorlanyapti...")
+        creative_raw = ask_llm(P.CREATIVE_SYSTEM, P.build_creative_prompt(base), 1500)
+        creative = P.parse_creative(creative_raw)
+
+        style = get_style(key)
+        dl_montajor, dl_dizayner = calc_deadlines(
+            row.get("sana"), row.get("montajor_deadline"))
+
+        # 3) Montajor TZ
+        m_text = P.build_montajor_tz(base, style, creative, dl_montajor)
+        m_head = f"#montajor #{no}\n{p[1]} · {nomi}\n{'─' * 20}\n"
+        await send_to_topic(context, th_video, m_head + m_text)
+        log_sent(key, no, "montajor", row["_id"])
+
+        # 4) Dizayner TZ (+ referens rasmlari)
         refs = get_refs(key, no) if no is not None else []
-
-        # 2) Uchala TZ
-        for tz_type, thread in (("operator", th_video),
-                                ("montajor", th_video),
-                                ("dizayner", th_dizayn)):
-            await wait.edit_text(
-                f"[{idx}/{len(selected)}] #{no} — {nomi[:30]}\n{tz_type} TZ yozilyapti...")
-
-            content = dict(base)
-            content["deadline"] = calc_deadline(row.get("sana"), tz_type)
-            system, user_msg = build_prompt(tz_type, key, content)
-            tz_text = ask_llm(system, user_msg)
-
-            tag = TYPES[tz_type][0]
-            header = f"{tag} #{no}\n{p[1]} · {nomi}\nDeadline: {content['deadline']}\n{'─' * 20}\n"
-            await send_to_topic(context, thread, header + tz_text,
-                                photos=refs if tz_type == "dizayner" else None)
-            log_sent(key, no, tz_type, row["_id"])
+        d_text = P.build_dizayner_tz(p[1], base, style, creative, dl_dizayner)
+        d_head = f"#dizayner #{no}\n{p[1]} · {nomi}\n{'─' * 20}\n"
+        await send_to_topic(context, th_dizayn, d_head + d_text, photos=refs)
+        log_sent(key, no, "dizayner", row["_id"])
 
         # 3) Notion holatini yangilash
         if status_name:
@@ -801,6 +942,7 @@ def main():
     app.add_handler(CommandHandler("royxat", cmd_royxat))
     app.add_handler(CommandHandler("ustun", cmd_ustun))
     app.add_handler(CommandHandler("yubor", cmd_yubor))
+    app.add_handler(CommandHandler("stil", cmd_stil))
 
     app.add_handler(MessageHandler(filters.PHOTO & filters.ChatType.PRIVATE, on_photo))
     app.add_handler(MessageHandler(
