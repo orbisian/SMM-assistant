@@ -776,6 +776,7 @@ async def cmd_yubor(update: Update, context: ContextTypes.DEFAULT_TYPE):
     th_dizayn = get_topic("tz_dizayn")
 
     done = []
+    skipped = []
     for idx, row in enumerate(selected, start=1):
         no = as_int(row.get("no"))
         nomi = row.get("nomi") or "(nomsiz)"
@@ -787,6 +788,11 @@ async def cmd_yubor(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except Exception as e:
             ssenariy = ""
             log.warning("Ssenariy o'qilmadi: %s", e)
+
+        # Ssenariy yo'q — jamoaga yubormaymiz
+        if not ssenariy or not ssenariy.strip():
+            skipped.append(f"#{no} {nomi[:35]}")
+            continue
 
         base = {
             "no": no,
@@ -809,8 +815,6 @@ async def cmd_yubor(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if row.get("sana"):
             head += f" · chiqish: {str(row['sana'])[:10]}"
         ss_text = f"{head}\n\n{ssenariy if ssenariy else '(ssenariy Notion sahifasida yozilmagan)'}"
-        if row.get("_url"):
-            ss_text += f"\n\nNotion: {row['_url']}"
         await send_to_topic(context, th_ssenariy, ss_text)
 
         # 2) Ijodiy qismlar — bitta LLM so'rovi (highlight, b-roll, cover matni)
@@ -849,9 +853,15 @@ async def cmd_yubor(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         done.append(f"#{no} {nomi[:35]}")
 
-    final = (f"✅ *{p[1]}* — {len(done)} ta kontent yuborildi\n\n" +
-             "\n".join(done) +
-             f"\n\nHolat «{STATUS_JARAYONDA}» ga o'tkazildi.")
+    if done:
+        final = (f"✅ *{p[1]}* — {len(done)} ta kontent yuborildi\n\n" +
+                 "\n".join(done) +
+                 f"\n\nHolat «{STATUS_JARAYONDA}» ga o'tkazildi.")
+    else:
+        final = f"*{p[1]}* — hech narsa yuborilmadi."
+    if skipped:
+        final += ("\n\n⏭ Ssenariy yozilmagan, o'tkazib yuborildi:\n" +
+                  "\n".join(skipped))
     if missing_nos:
         final += f"\n\n⚠️ Topilmadi: №{', '.join(map(str, missing_nos))}"
     await wait.edit_text(final, parse_mode=ParseMode.MARKDOWN)
